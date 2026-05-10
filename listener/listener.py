@@ -178,7 +178,15 @@ async def main() -> None:
     print(f"Kafka producer connected: {KAFKA_BOOTSTRAP} -> topic {KAFKA_TOPIC!r}")
 
     try:
-        await client.start()
+        # Don't call client.start() — its default is to prompt for phone via stdin
+        # if the session is invalid, which fails with EOFError in a container and
+        # restart-loops forever. Connect manually, check auth, fail fast otherwise.
+        await client.connect()
+        if not await client.is_user_authorized():
+            raise SystemExit(
+                "Session not authorized. Run interactively to (re-)login:\n"
+                "  docker compose run --rm -it listener python login.py"
+            )
         me = await client.get_me()
         print(f"Listening as {_fmt_sender(_sender_dict(me))}. Ctrl+C to stop.")
         await client.run_until_disconnected()
