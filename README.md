@@ -9,7 +9,7 @@ A Telegram user-account listens to a forum topic, every message is interpreted b
 ```
    Telegram                                   broker (MT4/MT5 via MetaApi)
        ▲                                                      ▲
-       │  user account (Telethon)                             │ market orders
+       │  user account (Telethon)                             │ limit orders
        │                                                      │
   ┌────┴─────┐    telegram-events    ┌──────────┐  trade-actions  ┌──────────┐
   │ listener │ ─────────────────────▶│ consumer │ ───────────────▶│ executor │
