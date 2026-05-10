@@ -12,7 +12,7 @@ load_dotenv(find_dotenv(usecwd=True))
 
 API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
-SESSION = os.environ.get("TG_SESSION", "data/listener")
+SESSION = os.environ.get("TG_SESSION", "/app/data/listener")
 CHAT_ID = int(os.environ["TG_CHAT_ID"]) if os.environ.get("TG_CHAT_ID") else None
 TOPIC_ID = int(os.environ["TG_TOPIC_ID"]) if os.environ.get("TG_TOPIC_ID") else None
 
