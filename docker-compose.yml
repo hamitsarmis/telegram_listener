@@ -35,8 +35,10 @@ services:
     container_name: telegram-listener
     env_file: .env
     volumes:
-      - ./data/listener.session:/app/listener.session
-      - ./data/media:/app/media
+      # Mount the whole data dir so Telethon can create listener.session itself.
+      # A single-file bind mount auto-creates a directory on the host if the
+      # file is missing, which then fails to open as SQLite.
+      - ./data:/app/data
     depends_on:
       kafka:
         condition: service_healthy
@@ -60,7 +62,7 @@ services:
     container_name: telegram-consumer
     env_file: .env
     volumes:
-      - ./data/media:/app/media:ro
+      - ./data:/app/data:ro
     depends_on:
       kafka:
         condition: service_healthy

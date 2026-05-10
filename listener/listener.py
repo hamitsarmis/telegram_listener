@@ -12,7 +12,7 @@ load_dotenv(find_dotenv(usecwd=True))
 
 API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
-SESSION = os.environ.get("TG_SESSION", "listener")
+SESSION = os.environ.get("TG_SESSION", "data/listener")
 CHAT_ID = int(os.environ["TG_CHAT_ID"]) if os.environ.get("TG_CHAT_ID") else None
 TOPIC_ID = int(os.environ["TG_TOPIC_ID"]) if os.environ.get("TG_TOPIC_ID") else None
 
@@ -21,8 +21,8 @@ KAFKA_TOPIC = os.environ.get("KAFKA_TOPIC", "telegram-events")
 
 CHATS_FILTER = [CHAT_ID] if CHAT_ID is not None else None
 
-MEDIA_DIR = Path("media")
-MEDIA_DIR.mkdir(exist_ok=True)
+MEDIA_DIR = Path("data/media")
+MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
 # Cache of recent messages so edits/deletes can include the prior content.
 # Telegram's delete event only carries message IDs, so without a cache we have nothing to publish.

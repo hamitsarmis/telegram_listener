@@ -8,7 +8,7 @@ load_dotenv(find_dotenv(usecwd=True))
 
 API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
-SESSION = os.environ.get("TG_SESSION", "listener")
+SESSION = os.environ.get("TG_SESSION", "data/listener")
 
 
 async def main() -> None:
