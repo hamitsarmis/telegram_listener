@@ -53,6 +53,8 @@ services:
     build: ./consumer
     container_name: telegram-consumer
     env_file: .env
+    volumes:
+      - ./data/media:/app/media:ro
     depends_on:
       kafka:
         condition: service_healthy

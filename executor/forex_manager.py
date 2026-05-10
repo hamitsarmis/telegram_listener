@@ -588,6 +588,212 @@ class ForexManager:
         f"trail@{self.trail_activation:.1f} dist={self.trail_distance:.1f}"
     )
 
+  async def open_pending_order(
+    self,
+    symbol: str,
+    side: Side,
+    volume: float,
+    *,
+    entry_price: float,
+    sl_price: Optional[float] = None,
+    tp_price: Optional[float] = None,
+  ) -> Dict[str, Any]:
+    """Place a pending entry order at `entry_price`.
+
+    MetaApi has separate limit/stop methods depending on which side of the
+    current price the entry sits on:
+      - buy: limit if entry < ask, stop if entry >= ask
+      - sell: limit if entry > bid, stop if entry <= bid
+    We pick the right one automatically — the broker rejects mismatches.
+    """
+    await self._ensure_ready()
+    await self._wait_for_close_all_done()
+
+    sym_lock = self._get_symbol_lock(symbol)
+    async with sym_lock:
+      price_data = await asyncio.wait_for(
+          self._conn.get_symbol_price(symbol),
+          timeout=self.rpc_timeout_sec,
+      )
+      current_ask = price_data["ask"]
+      current_bid = price_data["bid"]
+
+      kwargs: Dict[str, Any] = {
+          "symbol": symbol,
+          "volume": volume,
+          "open_price": entry_price,
+      }
+      if sl_price is not None:
+        kwargs["stop_loss"] = sl_price
+      if tp_price is not None:
+        kwargs["take_profit"] = tp_price
+
+      if side == "buy":
+        is_limit = entry_price < current_ask
+        method = (
+            self._conn.create_limit_buy_order if is_limit
+            else self._conn.create_stop_buy_order
+        )
+      else:
+        is_limit = entry_price > current_bid
+        method = (
+            self._conn.create_limit_sell_order if is_limit
+            else self._conn.create_stop_sell_order
+        )
+
+      kind = "limit" if is_limit else "stop"
+      self.log.info(
+          "open_pending_order -> MetaApi: %s %s %s vol=%s @ %s (ask=%s bid=%s)",
+          kind, side, symbol, volume, entry_price, current_ask, current_bid,
+      )
+
+      try:
+        response = await asyncio.wait_for(method(**kwargs), timeout=self.rpc_timeout_sec)
+      except ValidationException as e:
+        self.log.error(
+            "open_pending_order rejected by MetaApi (%s %s %s @ %s): %s | details=%r",
+            kind, side, symbol, entry_price, e, e.details,
+        )
+        raise
+
+      self.log.warning("Pending order created (%s %s %s @ %s): %s",
+                       kind, side, symbol, entry_price, response)
+      return response
+
+  async def modify_positions_for_symbol(
+    self,
+    symbol: str,
+    *,
+    stop_loss: Optional[float] = None,
+    take_profit: Optional[float] = None,
+  ) -> int:
+    """Apply the same SL and/or TP to every open position on `symbol`.
+
+    Returns the number of positions modified. Logs and continues on per-position
+    failure so a partial outage doesn't drop the rest of the batch.
+    """
+    if stop_loss is None and take_profit is None:
+      return 0
+
+    await self._ensure_ready()
+    positions = await self.get_positions()
+    matches = [p for p in positions if p.get("symbol") == symbol]
+    if not matches:
+      self.log.warning("modify_positions_for_symbol: no open positions for %s", symbol)
+      return 0
+
+    kwargs: Dict[str, Any] = {}
+    if stop_loss is not None:
+      kwargs["stop_loss"] = stop_loss
+    if take_profit is not None:
+      kwargs["take_profit"] = take_profit
+
+    modified = 0
+    for pos in matches:
+      pid = pos["id"]
+      try:
+        await asyncio.wait_for(
+            self._conn.modify_position(pid, **kwargs),
+            timeout=self.rpc_timeout_sec,
+        )
+        self.log.warning("modify_position %s (%s): %s", pid, symbol, kwargs)
+        modified += 1
+      except Exception as e:
+        self.log.error("modify_position %s failed: %s", pid, repr(e))
+    return modified
+
+  async def move_stop_to_entry_for_symbol(self, symbol: str) -> int:
+    """Move SL to each position's own openPrice (breakeven)."""
+    await self._ensure_ready()
+    positions = await self.get_positions()
+    matches = [p for p in positions if p.get("symbol") == symbol]
+    if not matches:
+      self.log.warning("move_stop_to_entry_for_symbol: no open positions for %s", symbol)
+      return 0
+
+    modified = 0
+    for pos in matches:
+      pid = pos["id"]
+      open_price = pos.get("openPrice")
+      if open_price is None:
+        self.log.warning("position %s has no openPrice; skipping", pid)
+        continue
+      try:
+        await asyncio.wait_for(
+            self._conn.modify_position(pid, stop_loss=open_price),
+            timeout=self.rpc_timeout_sec,
+        )
+        self.log.warning("move_stop_to_entry: position %s SL→%s", pid, open_price)
+        modified += 1
+      except Exception as e:
+        self.log.error("modify_position (move_to_entry) %s failed: %s", pid, repr(e))
+    return modified
+
+  async def partial_close_for_symbol(self, symbol: str, fraction: float) -> int:
+    """Close `fraction` (0..1) of each open position's volume on `symbol`."""
+    if not (0 < fraction <= 1):
+      self.log.warning("partial_close_for_symbol: invalid fraction %r", fraction)
+      return 0
+
+    await self._ensure_ready()
+    positions = await self.get_positions()
+    matches = [p for p in positions if p.get("symbol") == symbol]
+    if not matches:
+      self.log.warning("partial_close_for_symbol: no open positions for %s", symbol)
+      return 0
+
+    closed = 0
+    for pos in matches:
+      pid = pos["id"]
+      vol = pos.get("volume") or 0
+      close_vol = round(vol * fraction, 2)
+      if close_vol <= 0:
+        self.log.warning("partial_close: position %s volume too small (%s × %s)", pid, vol, fraction)
+        continue
+      try:
+        await asyncio.wait_for(
+            self._conn.close_position_partially(pid, close_vol),
+            timeout=self.rpc_timeout_sec,
+        )
+        self.log.warning("partial_close: position %s closed %s of %s", pid, close_vol, vol)
+        closed += 1
+      except Exception as e:
+        self.log.error("partial_close %s failed: %s", pid, repr(e))
+    return closed
+
+  async def update_takeprofit_from_pips_for_symbol(
+    self, symbol: str, base_price: float, distance: float
+  ) -> int:
+    """Set TP = base_price ± distance per position, based on its direction.
+
+    `distance` is in price units (executor multiplies pips × pip_value).
+    Buy positions get base+distance; sell positions get base-distance.
+    """
+    await self._ensure_ready()
+    positions = await self.get_positions()
+    matches = [p for p in positions if p.get("symbol") == symbol]
+    if not matches:
+      self.log.warning("update_takeprofit_from_pips: no open positions for %s", symbol)
+      return 0
+
+    modified = 0
+    for pos in matches:
+      pid = pos["id"]
+      # MetaApi position type: "POSITION_TYPE_BUY" or "POSITION_TYPE_SELL"
+      pos_type = pos.get("type", "")
+      is_buy = "BUY" in pos_type.upper()
+      tp = base_price + distance if is_buy else base_price - distance
+      try:
+        await asyncio.wait_for(
+            self._conn.modify_position(pid, take_profit=tp),
+            timeout=self.rpc_timeout_sec,
+        )
+        self.log.warning("update_takeprofit_from_pips: position %s (%s) TP→%s", pid, pos_type, tp)
+        modified += 1
+      except Exception as e:
+        self.log.error("modify_position (tp_from_pips) %s failed: %s", pid, repr(e))
+    return modified
+
   async def _find_position_by_client_id(
     self,
     client_id: str,

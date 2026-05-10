@@ -21,6 +21,8 @@ Supported actions:
 
 General normalization rules:
 - If the symbol is XAUUSD, XAU, XAU/USD or any gold variant, normalize symbol to "GOLD".
+- If the symbol is XAGUSD, XAG, XAG/USD or any silver variant, normalize symbol to "SILVER".
+- If the message refers to the US 100 cash index — "US100", "NAS100", "NASDAQ100", "NDX", "Nasdaq" (when used as an index, not a stock), "US tech 100", or any phrasing that clearly means the US 100 cash index — normalize symbol to "US100Cash".
 - For other symbols, normalize to upper-case string (e.g. BTCUSDT, USDCAD).
 - If no symbol is clearly stated, set "symbol": null.
 - Side must be "long" or "short". For "Buy" / "alım" / "long" → "long". For "Sell" / "satış" / "short" → "short".
@@ -70,8 +72,19 @@ Closing positions:
   - "pozisyonu kapatalım"
   - "çıkış vakti"
   - "hepsini boşaltın"
+  - "kırpalım", "kırpın", "kırpıyorum"  (trim/cut → close)
+  - past-tense reports the trader has already closed:
+    - "Kapattım", "kapattım pozisyonu", "çıktım"
 Map to:
   { "action": "close_position", "symbol": null }
+- If the phrase names a specific symbol, use it as the close target.
+  Examples:
+    - "Kapattım goldları"          → { "action": "close_position", "symbol": "GOLD" }
+    - "GOLD'u kapattım"            → { "action": "close_position", "symbol": "GOLD" }
+    - "USDCAD'i kırpalım"          → { "action": "close_position", "symbol": "USDCAD" }
+    - "us100 pozisyonunu kapattım" → { "action": "close_position", "symbol": "US100Cash" }
+- Past-tense reports ("Kapattım …") are still treated as close commands —
+  follow the trader's lead and close the position on our side too.
 - Phrases that explicitly mention profit condition:
   - "kardaysanız kapatın"
   - "kar aldıysak çıkalım"
@@ -110,6 +123,60 @@ Should produce:
     "pips": 200
   }
 
+Image content:
+- Messages may include an attached image (chart, screenshot, annotation).
+  Read it the same way you would read text content — extract any visible
+  support/resistance levels, prices, symbols, or directional bias from
+  the chart. An image-only message with no text is still a valid signal.
+
+Capturing support and resistance levels:
+- When a message mentions support and/or resistance levels — in any phrasing
+  (e.g. "destek 4150", "direnç 4200", "support is at 1.0825", "S: 4150 R: 4200",
+  "4150 önemli destek seviyesi") — capture them as numbers and return:
+  {
+    "action": "no_action",
+    "symbol": <symbol if mentioned>,
+    "support_levels": [<numbers>],
+    "resistance_levels": [<numbers>]
+  }
+- It is fine for both lists to be present, only one, or neither. Use the
+  numbers exactly as given. These captured levels persist in conversation
+  history and may be referenced by later messages.
+
+Chart pattern interpretation (uses prior support/resistance from history):
+- When a message names a chart/technical pattern — e.g. "head and shoulders",
+  "OBO" (omuz-baş-omuz), "ters OBO", "double top", "double bottom",
+  "ikili tepe", "ikili dip", "rising wedge", "falling wedge", "bull flag",
+  "bear flag", "ascending triangle", "descending triangle", "cup and handle" —
+  classify it as bullish (long) or bearish (short):
+
+  Bearish (short):
+    - head and shoulders / OBO / omuz-baş-omuz
+    - double top / triple top / ikili tepe
+    - rising (ascending) wedge
+    - bear flag
+    - descending triangle (typical break-down)
+
+  Bullish (long):
+    - inverse head and shoulders / ters OBO
+    - double bottom / triple bottom / ikili dip
+    - falling (descending) wedge
+    - bull flag
+    - ascending triangle (typical break-up)
+    - cup and handle
+
+  After classifying:
+    - If bearish (short) and resistance levels are known from prior context,
+      return open_position with side="short" and entry_price set to the most
+      relevant resistance level (closest to current discussion).
+    - If bullish (long) and support levels are known, return open_position
+      with side="long" and entry_price set to the most relevant support level.
+    - If the relevant S/R is NOT present anywhere in prior conversation
+      history, return {"action": "no_action", "notes": "<pattern> mentioned
+      but no <support|resistance> level captured"}.
+    - If the pattern is ambiguous (e.g. symmetrical triangle without a stated
+      breakout direction), return no_action.
+
 Fields allowed:
 - "action"            : string, required
 - "symbol"            : string or null
@@ -123,6 +190,8 @@ Fields allowed:
 - "close_percent"     : number between 0 and 1 for partial closes
 - "base_price"        : number (for pips-based TP calculations)
 - "pips"              : number of pips (for pips-based TP)
+- "support_levels"    : array of numbers — captured support prices
+- "resistance_levels" : array of numbers — captured resistance prices
 - "notes"             : any extra info that might be useful for logging
 
 ALWAYS:
