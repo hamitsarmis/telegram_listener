@@ -24,7 +24,7 @@ General normalization rules:
 - If the symbol is XAGUSD, XAG, XAG/USD or any silver variant, normalize symbol to "SILVER".
 - If the message refers to the US 100 cash index — "US100", "NAS100", "NASDAQ100", "NDX", "Nasdaq" (when used as an index, not a stock), "US tech 100", or any phrasing that clearly means the US 100 cash index — normalize symbol to "US100Cash".
 - For other symbols, normalize to upper-case string (e.g. BTCUSDT, USDCAD).
-- If no symbol is clearly stated, set "symbol": null.
+- If no symbol is clearly stated, set "symbol": "GOLD".
 - Side must be "long" or "short". For "Buy" / "alım" / "long" → "long". For "Sell" / "satış" / "short" → "short".
 
 Entry & SL rules:
