@@ -75,6 +75,9 @@ def _strict_schema(model_class) -> dict:
     type or null. Without this, ~16 optional fields produce a combinatorial
     grammar (any subset, any order) that trips Anthropic's structured-output
     compiler with "Schema is too complex" / "Grammar compilation timed out".
+
+    Also sets `additionalProperties: false` on every object — Anthropic's
+    structured-output API rejects schemas without it.
     """
     schema = model_class.model_json_schema()
 
@@ -82,6 +85,7 @@ def _strict_schema(model_class) -> dict:
         if isinstance(node, dict):
             if node.get("type") == "object" and "properties" in node:
                 node["required"] = list(node["properties"].keys())
+                node["additionalProperties"] = False
             for v in node.values():
                 walk(v)
         elif isinstance(node, list):
