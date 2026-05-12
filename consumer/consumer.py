@@ -67,13 +67,21 @@ class TradeAction(BaseModel):
 
 
 def _strict_schema(model_class) -> dict:
-    """Pydantic → Anthropic-strict JSON Schema (additionalProperties: false on all objects)."""
+    """Pydantic → Anthropic JSON Schema.
+
+    Makes every property `required` while keeping `Optional[X]` nullable
+    (`anyOf: [X, null]` is left intact). The resulting schema is a fixed
+    shape: every field always appears, with a value of either the declared
+    type or null. Without this, ~16 optional fields produce a combinatorial
+    grammar (any subset, any order) that trips Anthropic's structured-output
+    compiler with "Schema is too complex" / "Grammar compilation timed out".
+    """
     schema = model_class.model_json_schema()
 
     def walk(node):
         if isinstance(node, dict):
             if node.get("type") == "object" and "properties" in node:
-                node["additionalProperties"] = False
+                node["required"] = list(node["properties"].keys())
             for v in node.values():
                 walk(v)
         elif isinstance(node, list):
