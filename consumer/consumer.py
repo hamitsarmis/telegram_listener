@@ -20,7 +20,8 @@ KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP", "kafka:9092")
 KAFKA_TOPIC = os.environ.get("KAFKA_TOPIC", "telegram-events")
 KAFKA_ACTIONS_TOPIC = os.environ.get("KAFKA_ACTIONS_TOPIC", "trade-actions")
 GROUP_ID = os.environ.get("KAFKA_GROUP_ID", "telegram-consumer")
-ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-7")
+ANTHROPIC_MODEL_TEXT = os.environ.get("ANTHROPIC_MODEL_TEXT", "claude-haiku-4-5")
+ANTHROPIC_MODEL_IMAGE = os.environ.get("ANTHROPIC_MODEL_IMAGE", "claude-opus-4-7")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
 
 SYSTEM_PROMPT = (Path(__file__).parent / "prompt.md").read_text()
@@ -140,10 +141,12 @@ async def interpret(
 
     # Build the new user turn — image content (if any) plus text.
     user_content: list[dict] = []
+    has_image = False
     if media_path:
         block = _image_block(media_path)
         if block is not None:
             user_content.append(block)
+            has_image = True
     if text:
         user_content.append({"type": "text", "text": text})
     elif user_content:
@@ -154,10 +157,15 @@ async def interpret(
 
     messages.append({"role": "user", "content": user_content})
 
+    # Vision-capable Opus only when the turn actually carries an image — text-only
+    # turns go to Haiku (~15× cheaper). Mid-thread model switches are fine: the
+    # message history is portable across Anthropic models.
+    model = ANTHROPIC_MODEL_IMAGE if has_image else ANTHROPIC_MODEL_TEXT
+
     try:
         resp = await anthropic_client.beta.messages.create(
             betas=["compact-2026-01-12"],
-            model=ANTHROPIC_MODEL,
+            model=model,
             max_tokens=1024,
             system=[{
                 "type": "text",
@@ -248,7 +256,7 @@ async def main() -> None:
     print(f"Consuming {KAFKA_TOPIC!r} from {KAFKA_BOOTSTRAP} (group={GROUP_ID})")
     print(f"Publishing actions to {KAFKA_ACTIONS_TOPIC!r}")
     print(f"Redis: {REDIS_URL} (per-chat thread w/ server-side compaction)")
-    print(f"Claude model: {ANTHROPIC_MODEL}")
+    print(f"Claude models: text={ANTHROPIC_MODEL_TEXT} image={ANTHROPIC_MODEL_IMAGE}")
     try:
         async for msg in consumer:
             try:
