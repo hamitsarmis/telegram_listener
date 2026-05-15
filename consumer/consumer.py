@@ -410,10 +410,11 @@ async def main() -> None:
     print(f"Redis: {REDIS_URL} (per-chat thread, namespaced by backend)")
     if USE_DEEPSEEK:
         print(f"Backend: DeepSeek @ {DEEPSEEK_BASE_URL}")
-        print(f"DeepSeek models: text={DEEPSEEK_MODEL_TEXT} image={DEEPSEEK_MODEL_IMAGE}")
+        active_text, active_image = DEEPSEEK_MODEL_TEXT, DEEPSEEK_MODEL_IMAGE
     else:
         print("Backend: Anthropic")
-        print(f"Claude models: text={ANTHROPIC_MODEL_TEXT} image={ANTHROPIC_MODEL_IMAGE}")
+        active_text, active_image = ANTHROPIC_MODEL_TEXT, ANTHROPIC_MODEL_IMAGE
+    print(f"Models: text={active_text} image={active_image}")
     try:
         async for msg in consumer:
             try:
