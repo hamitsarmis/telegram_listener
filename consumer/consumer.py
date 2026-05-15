@@ -8,10 +8,12 @@ from pathlib import Path
 from typing import Literal, Optional
 
 import anthropic
+import openai
 import redis.asyncio as redis
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from anthropic import AsyncAnthropic
 from dotenv import find_dotenv, load_dotenv
+from openai import AsyncOpenAI
 from pydantic import BaseModel
 
 load_dotenv(find_dotenv(usecwd=True))
@@ -20,13 +22,40 @@ KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP", "kafka:9092")
 KAFKA_TOPIC = os.environ.get("KAFKA_TOPIC", "telegram-events")
 KAFKA_ACTIONS_TOPIC = os.environ.get("KAFKA_ACTIONS_TOPIC", "trade-actions")
 GROUP_ID = os.environ.get("KAFKA_GROUP_ID", "telegram-consumer")
+
+USE_DEEPSEEK = os.environ.get("USE_DEEPSEEK", "false").strip().lower() in ("true", "1", "yes", "on")
+BACKEND = "deepseek" if USE_DEEPSEEK else "anthropic"
+
 ANTHROPIC_MODEL_TEXT = os.environ.get("ANTHROPIC_MODEL_TEXT", "claude-haiku-4-5")
 ANTHROPIC_MODEL_IMAGE = os.environ.get("ANTHROPIC_MODEL_IMAGE", "claude-opus-4-7")
+
+DEEPSEEK_MODEL_TEXT = os.environ.get("DEEPSEEK_MODEL_TEXT", "deepseek-chat")
+DEEPSEEK_MODEL_IMAGE = os.environ.get("DEEPSEEK_MODEL_IMAGE", "deepseek-chat")
+DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+# DeepSeek has no server-side compaction (Anthropic does via compact_20260112);
+# without a cap the thread grows until it exceeds the model's context window and
+# every subsequent call for that chat fails permanently.
+DEEPSEEK_MAX_TURNS = int(os.environ.get("DEEPSEEK_MAX_TURNS", "20"))
+
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
 
 SYSTEM_PROMPT = (Path(__file__).parent / "prompt.md").read_text()
 
-anthropic_client = AsyncAnthropic()  # reads ANTHROPIC_API_KEY from env
+# One backend per process. The unused client is left as None so attribute access fails
+# loudly if the dispatch ever picks the wrong path.
+anthropic_client: AsyncAnthropic | None = None
+deepseek_client: AsyncOpenAI | None = None
+if USE_DEEPSEEK:
+    # Validate explicitly: passing api_key=None to AsyncOpenAI would silently
+    # fall back to OPENAI_API_KEY in the env, sending an OpenAI bearer token
+    # to api.deepseek.com.
+    _deepseek_key = os.environ.get("DEEPSEEK_API_KEY")
+    if not _deepseek_key:
+        raise RuntimeError("DEEPSEEK_API_KEY is required when USE_DEEPSEEK=true")
+    deepseek_client = AsyncOpenAI(api_key=_deepseek_key, base_url=DEEPSEEK_BASE_URL)
+else:
+    anthropic_client = AsyncAnthropic()  # reads ANTHROPIC_API_KEY from env
+
 redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 producer: AIOKafkaProducer | None = None
 
@@ -105,11 +134,21 @@ def _ts() -> str:
 
 
 def _thread_key(chat_id, topic_id) -> str:
-    return f"tg:thread:{chat_id}:{topic_id or 0}"
+    # Namespaced by backend: Anthropic content blocks and OpenAI message format
+    # are not interchangeable, so flipping USE_DEEPSEEK must not reuse the same thread.
+    return f"tg:thread:{BACKEND}:{chat_id}:{topic_id or 0}"
 
 
 async def get_thread(chat_id, topic_id) -> list[dict]:
-    raw = await redis_client.get(_thread_key(chat_id, topic_id))
+    key = _thread_key(chat_id, topic_id)
+    raw = await redis_client.get(key)
+    if raw is None and not USE_DEEPSEEK:
+        # Pre-namespace deployments wrote `tg:thread:{chat_id}:{topic_id}`. Migrate
+        # on first read so existing chats keep their captured S/R history.
+        legacy = f"tg:thread:{chat_id}:{topic_id or 0}"
+        raw = await redis_client.get(legacy)
+        if raw is not None:
+            await redis_client.rename(legacy, key)
     return json.loads(raw) if raw else []
 
 
@@ -117,7 +156,7 @@ async def save_thread(chat_id, topic_id, messages: list[dict]) -> None:
     await redis_client.set(_thread_key(chat_id, topic_id), json.dumps(messages))
 
 
-def _image_block(media_path: str) -> dict | None:
+def _load_image(media_path: str) -> tuple[str, str] | None:
     # The path comes from the listener's POV (e.g. "media/-100..._123.jpg").
     # Inside the consumer container, ./data/media is mounted at /app/media,
     # so the same relative path resolves correctly.
@@ -128,13 +167,40 @@ def _image_block(media_path: str) -> dict | None:
     if not mime.startswith("image/"):
         return None
     data = base64.standard_b64encode(p.read_bytes()).decode()
+    return mime, data
+
+
+def _image_block_anthropic(media_path: str) -> dict | None:
+    loaded = _load_image(media_path)
+    if loaded is None:
+        return None
+    mime, data = loaded
     return {
         "type": "image",
         "source": {"type": "base64", "media_type": mime, "data": data},
     }
 
 
+def _image_block_openai(media_path: str) -> dict | None:
+    loaded = _load_image(media_path)
+    if loaded is None:
+        return None
+    mime, data = loaded
+    return {
+        "type": "image_url",
+        "image_url": {"url": f"data:{mime};base64,{data}"},
+    }
+
+
 async def interpret(
+    text: str, chat_id, topic_id, media_path: str | None = None
+) -> TradeAction | None:
+    if USE_DEEPSEEK:
+        return await _interpret_deepseek(text, chat_id, topic_id, media_path)
+    return await _interpret_anthropic(text, chat_id, topic_id, media_path)
+
+
+async def _interpret_anthropic(
     text: str, chat_id, topic_id, media_path: str | None = None
 ) -> TradeAction | None:
     messages = await get_thread(chat_id, topic_id)
@@ -143,7 +209,7 @@ async def interpret(
     user_content: list[dict] = []
     has_image = False
     if media_path:
-        block = _image_block(media_path)
+        block = _image_block_anthropic(media_path)
         if block is not None:
             user_content.append(block)
             has_image = True
@@ -198,6 +264,92 @@ async def interpret(
                 print(f"[{_ts()}] !! parse error: {e} | raw={block.text!r}")
                 return None
     return None
+
+
+def _strip_image_blocks(messages: list[dict]) -> list[dict]:
+    """Drop image_url blocks from prior turns.
+
+    Two reasons: (1) the text-only DeepSeek model rejects historical image_url
+    content, and (2) base64 image bytes inflate the request by 70-90K tokens per
+    image and re-paying that on every later turn quickly blows the context
+    window. The assistant's structured JSON reply already captured what was in
+    the chart (S/R levels, etc.), so the bytes themselves are dead weight.
+    """
+    out: list[dict] = []
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            text_parts = [b for b in content if b.get("type") == "text"]
+            if text_parts:
+                joined = "\n".join(b["text"] for b in text_parts)
+                out.append({**m, "content": joined})
+            else:
+                out.append({**m, "content": "(image attachment omitted from history)"})
+        else:
+            out.append(m)
+    return out
+
+
+async def _interpret_deepseek(
+    text: str, chat_id, topic_id, media_path: str | None = None
+) -> TradeAction | None:
+    messages = await get_thread(chat_id, topic_id)
+
+    user_content: list[dict] = []
+    has_image = False
+    if media_path:
+        block = _image_block_openai(media_path)
+        if block is not None:
+            user_content.append(block)
+            has_image = True
+    if text:
+        user_content.append({"type": "text", "text": text})
+    elif user_content:
+        user_content.append({"type": "text", "text": "(image only — interpret as trading signal)"})
+
+    if not user_content:
+        return None
+
+    # OpenAI-style: text-only turns can use a plain string for content; multimodal
+    # turns must be the list form. Both shapes are accepted by the chat API.
+    if has_image:
+        new_msg_content: str | list[dict] = user_content
+    else:
+        new_msg_content = "\n".join(b["text"] for b in user_content if b.get("type") == "text")
+    messages.append({"role": "user", "content": new_msg_content})
+
+    model = DEEPSEEK_MODEL_IMAGE if has_image else DEEPSEEK_MODEL_TEXT
+
+    # Bound the request: strip historical image bytes (always — see helper docstring)
+    # and keep only the most recent N user/assistant pairs.
+    history_for_request = _strip_image_blocks(messages)
+    if len(history_for_request) > DEEPSEEK_MAX_TURNS * 2:
+        history_for_request = history_for_request[-DEEPSEEK_MAX_TURNS * 2:]
+    full_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history_for_request
+
+    try:
+        resp = await deepseek_client.chat.completions.create(
+            model=model,
+            max_tokens=1024,
+            messages=full_messages,
+            response_format={"type": "json_object"},
+        )
+    except openai.OpenAIError as e:
+        print(f"[{_ts()}] !! deepseek error: {e}")
+        return None
+
+    raw = resp.choices[0].message.content or ""
+    # Persist the bounded, image-stripped form so Redis size stays in check —
+    # we already sent that exact view to the model, so nothing the assistant
+    # responded to is lost.
+    persisted = history_for_request + [{"role": "assistant", "content": raw}]
+    await save_thread(chat_id, topic_id, persisted)
+
+    try:
+        return TradeAction.model_validate_json(raw)
+    except Exception as e:
+        print(f"[{_ts()}] !! parse error: {e} | raw={raw!r}")
+        return None
 
 
 async def handle_event(event: dict) -> None:
@@ -255,8 +407,13 @@ async def main() -> None:
     await redis_client.ping()
     print(f"Consuming {KAFKA_TOPIC!r} from {KAFKA_BOOTSTRAP} (group={GROUP_ID})")
     print(f"Publishing actions to {KAFKA_ACTIONS_TOPIC!r}")
-    print(f"Redis: {REDIS_URL} (per-chat thread w/ server-side compaction)")
-    print(f"Claude models: text={ANTHROPIC_MODEL_TEXT} image={ANTHROPIC_MODEL_IMAGE}")
+    print(f"Redis: {REDIS_URL} (per-chat thread, namespaced by backend)")
+    if USE_DEEPSEEK:
+        print(f"Backend: DeepSeek @ {DEEPSEEK_BASE_URL}")
+        print(f"DeepSeek models: text={DEEPSEEK_MODEL_TEXT} image={DEEPSEEK_MODEL_IMAGE}")
+    else:
+        print("Backend: Anthropic")
+        print(f"Claude models: text={ANTHROPIC_MODEL_TEXT} image={ANTHROPIC_MODEL_IMAGE}")
     try:
         async for msg in consumer:
             try:
